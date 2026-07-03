@@ -2,13 +2,15 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response
+from sqlalchemy.ext.asyncio import AsyncSession
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import Connect, VoiceResponse
 
+from database import get_db
 from agent_engine import build_agent_session
-from action_queue import action_queue, ActionType
+from action_queue import ActionQueueManager, ActionType
 from scraper_enhanced import scrape_business_website
 
 logger = logging.getLogger(__name__)
@@ -45,10 +47,11 @@ async def handle_incoming_call(tenant_id: str, request: Request) -> Response:
 
 
 @router.websocket("/ai-stream/{tenant_id}")
-async def ai_media_stream(websocket: WebSocket, tenant_id: str):
+async def ai_media_stream(websocket: WebSocket, tenant_id: str, session: AsyncSession = Depends(get_db)):
     await websocket.accept()
     config  = _get_tenant_config(tenant_id)
-    session = build_agent_session(tenant_id, config)
+    session_obj = build_agent_session(tenant_id, config)
+    action_manager = ActionQueueManager(session)
     call_sid: Optional[str] = None
     try:
         async for raw in websocket.iter_text():
@@ -56,10 +59,10 @@ async def ai_media_stream(websocket: WebSocket, tenant_id: str):
             event_type = data.get("event")
             if event_type == "start":
                 call_sid = data["start"]["callSid"]
-                session.set_call_sid(call_sid)
+                session_obj.set_call_sid(call_sid)
             elif event_type == "media":
                 audio_chunk = data["media"]["payload"]
-                response_audio, fn_calls = await session.process_audio(audio_chunk)
+                response_audio, fn_calls = await session_obj.process_audio(audio_chunk)
                 for fn in fn_calls:
                     fn_name = fn["name"]
                     args = fn["arguments"]
@@ -67,11 +70,11 @@ async def ai_media_stream(websocket: WebSocket, tenant_id: str):
                     # Handle different function calls
                     if fn_name == "submit_kitchen_order":
                         # Backward compatible - orders still work
-                        await action_queue.broadcast_order(tenant_id, args)
+                        await action_manager.broadcast_order(tenant_id, args)
                     elif fn_name == "submit_action":
                         # New generic action handler
                         action_type = args.get("action_type", "ORDER")
-                        await action_queue.broadcast_new_action(
+                        await action_manager.broadcast_new_action(
                             tenant_id,
                             ActionType(action_type),
                             args.get("customer_info", {}),
@@ -79,7 +82,7 @@ async def ai_media_stream(websocket: WebSocket, tenant_id: str):
                         )
                     elif fn_name == "create_lead":
                         # Create a lead action
-                        await action_queue.broadcast_new_action(
+                        await action_manager.broadcast_new_action(
                             tenant_id,
                             ActionType.LEAD,
                             {
@@ -105,7 +108,7 @@ async def ai_media_stream(websocket: WebSocket, tenant_id: str):
     except WebSocketDisconnect:
         logger.info("Twilio WS disconnected | tenant=%s", tenant_id)
     finally:
-        await session.close()
+        await session_obj.close()
 
 
 async def _hot_transfer(call_sid: str, owner_phone: str, tenant_id: str) -> None:
