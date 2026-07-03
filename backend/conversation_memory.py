@@ -1,6 +1,7 @@
 """
 Conversation Memory & Context Management
 Stores conversations, extracts entities, builds AI context
+Uses SQLAlchemy ORM with Supabase PostgreSQL
 """
 
 import json
@@ -9,17 +10,24 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from models import Conversation
 
-# In-memory storage (replace with DB in production)
-CONVERSATIONS = {}  # {tenant_id: [conversations]}
+logger = logging.getLogger(__name__)
 
 
 class ConversationMemory:
-    """Manages conversation storage and context building."""
+    """Manages conversation storage and context building via database."""
 
-    def __init__(self):
-        self.conversations = CONVERSATIONS
+    def __init__(self, session: AsyncSession):
+        """
+        Initialize with database session.
+        
+        Args:
+            session: AsyncSession from SQLAlchemy
+        """
+        self.session = session
 
     async def create_conversation(
         self,
@@ -28,7 +36,7 @@ class ConversationMemory:
         customer_phone: Optional[str] = None,
     ) -> dict:
         """
-        Create a new conversation record.
+        Create a new conversation record in database.
 
         Args:
             tenant_id: Business tenant ID
@@ -44,27 +52,23 @@ class ConversationMemory:
         try:
             conversation_id = str(uuid.uuid4())
 
-            conversation = {
-                "conversation_id": conversation_id,
-                "tenant_id": tenant_id,
-                "call_sid": call_sid,
-                "customer_phone": customer_phone,
-                "transcript": [],  # [{role: "user"/"ai", text: "...", timestamp: "..."}, ...]
-                "intent": None,
-                "entities": {},  # {name, email, phone, date, items, etc.}
-                "ai_handled": True,
-                "transferred_to_human": False,
-                "outcome": None,
-                "duration_seconds": 0,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
+            conversation = Conversation(
+                conversation_id=conversation_id,
+                tenant_id=tenant_id,
+                call_sid=call_sid,
+                customer_phone=customer_phone,
+                transcript=[],  # Initialize as empty array
+                entities={},    # Initialize as empty object
+                intent=None,
+                summary=None,
+                outcome=None,
+                transferred_to_human=False,
+                duration_seconds=0,
+            )
 
-            # Store conversation
-            if tenant_id not in self.conversations:
-                self.conversations[tenant_id] = []
-
-            self.conversations[tenant_id].append(conversation)
+            # Save to database
+            self.session.add(conversation)
+            await self.session.commit()
 
             logger.info(
                 f"Conversation created | tenant={tenant_id} | conversation_id={conversation_id}"
@@ -74,6 +78,7 @@ class ConversationMemory:
 
         except Exception as e:
             logger.error(f"Create conversation error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e)}
 
     async def add_message(
@@ -85,7 +90,7 @@ class ConversationMemory:
         entities: Optional[dict] = None,
     ) -> dict:
         """
-        Add a message to a conversation.
+        Add a message to a conversation in database.
 
         Args:
             tenant_id: Business tenant ID
@@ -98,40 +103,45 @@ class ConversationMemory:
             Status of addition
         """
         try:
-            conversations = self.conversations.get(tenant_id, [])
-
-            conversation = None
-            for conv in conversations:
-                if conv["conversation_id"] == conversation_id:
-                    conversation = conv
-                    break
+            # Query conversation from database
+            stmt = select(Conversation).where(
+                (Conversation.tenant_id == tenant_id) &
+                (Conversation.conversation_id == conversation_id)
+            )
+            result = await self.session.execute(stmt)
+            conversation = result.scalar_one_or_none()
 
             if not conversation:
                 return {"status": "error", "error": "Conversation not found"}
 
-            # Add message to transcript
+            # Add message to transcript array
             message = {
                 "role": role,
                 "text": text,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-            conversation["transcript"].append(message)
+            if conversation.transcript is None:
+                conversation.transcript = []
+            conversation.transcript.append(message)
 
             # Update entities if provided
             if entities:
-                conversation["entities"].update(entities)
+                if conversation.entities is None:
+                    conversation.entities = {}
+                conversation.entities.update(entities)
 
             # Detect intent from user message
             if role == "user":
-                conversation["intent"] = self._detect_intent(text)
+                conversation.intent = self._detect_intent(text)
 
-            conversation["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await self.session.commit()
 
-            return {"status": "success", "transcript_length": len(conversation["transcript"])}
+            return {"status": "success", "transcript_length": len(conversation.transcript)}
 
         except Exception as e:
             logger.error(f"Add message error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e)}
 
     async def close_conversation(
@@ -143,7 +153,7 @@ class ConversationMemory:
         duration_seconds: int = 0,
     ) -> dict:
         """
-        Close a conversation and finalize context.
+        Close a conversation and finalize context in database.
 
         Args:
             tenant_id: Business tenant ID
@@ -156,41 +166,55 @@ class ConversationMemory:
             Final conversation record
         """
         try:
-            conversations = self.conversations.get(tenant_id, [])
-
-            conversation = None
-            for conv in conversations:
-                if conv["conversation_id"] == conversation_id:
-                    conversation = conv
-                    break
+            # Query conversation from database
+            stmt = select(Conversation).where(
+                (Conversation.tenant_id == tenant_id) &
+                (Conversation.conversation_id == conversation_id)
+            )
+            result = await self.session.execute(stmt)
+            conversation = result.scalar_one_or_none()
 
             if not conversation:
                 return {"status": "error", "error": "Conversation not found"}
 
             # Finalize conversation
-            conversation["outcome"] = outcome
-            conversation["transferred_to_human"] = transferred_to_human
-            conversation["duration_seconds"] = duration_seconds
-            conversation["transcript_text"] = self._build_transcript_text(
-                conversation["transcript"]
-            )
-            conversation["closed_at"] = datetime.now(timezone.utc).isoformat()
+            conversation.outcome = outcome
+            conversation.transferred_to_human = transferred_to_human
+            conversation.duration_seconds = duration_seconds
+            conversation.summary = self._build_transcript_text(conversation.transcript)
+
+            await self.session.commit()
 
             logger.info(
                 f"Conversation closed | conversation_id={conversation_id} | outcome={outcome}"
             )
 
-            return {"status": "success", "conversation": conversation}
+            return {
+                "status": "success",
+                "conversation": {
+                    "conversation_id": conversation.conversation_id,
+                    "tenant_id": conversation.tenant_id,
+                    "call_sid": conversation.call_sid,
+                    "customer_phone": conversation.customer_phone,
+                    "intent": conversation.intent,
+                    "outcome": conversation.outcome,
+                    "transferred_to_human": conversation.transferred_to_human,
+                    "duration_seconds": conversation.duration_seconds,
+                    "transcript_length": len(conversation.transcript) if conversation.transcript else 0,
+                    "created_at": conversation.created_at.isoformat(),
+                },
+            }
 
         except Exception as e:
             logger.error(f"Close conversation error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e)}
 
     async def get_conversation_context(
         self, tenant_id: str, conversation_id: str
     ) -> dict:
         """
-        Get conversation context for AI to review.
+        Get conversation context for AI to review from database.
 
         Returns:
             {
@@ -201,13 +225,13 @@ class ConversationMemory:
             }
         """
         try:
-            conversations = self.conversations.get(tenant_id, [])
-
-            conversation = None
-            for conv in conversations:
-                if conv["conversation_id"] == conversation_id:
-                    conversation = conv
-                    break
+            # Query conversation from database
+            stmt = select(Conversation).where(
+                (Conversation.tenant_id == tenant_id) &
+                (Conversation.conversation_id == conversation_id)
+            )
+            result = await self.session.execute(stmt)
+            conversation = result.scalar_one_or_none()
 
             if not conversation:
                 return {"status": "error", "error": "Conversation not found"}
@@ -216,10 +240,10 @@ class ConversationMemory:
                 "status": "success",
                 "context": {
                     "conversation_id": conversation_id,
-                    "entities": conversation["entities"],
-                    "transcript": conversation["transcript"],
-                    "intent": conversation["intent"],
-                    "outcome": conversation["outcome"],
+                    "entities": conversation.entities or {},
+                    "transcript": conversation.transcript or [],
+                    "intent": conversation.intent,
+                    "outcome": conversation.outcome,
                     "summary": self._summarize_conversation(conversation),
                 },
             }
@@ -231,17 +255,31 @@ class ConversationMemory:
     async def get_recent_conversations(
         self, tenant_id: str, limit: int = 50
     ) -> dict:
-        """Get recent conversations for a tenant."""
+        """Get recent conversations for a tenant from database."""
         try:
-            conversations = self.conversations.get(tenant_id, [])
-
-            # Sort by creation time (newest first)
-            conversations.sort(key=lambda x: x["created_at"], reverse=True)
+            stmt = select(Conversation).where(
+                Conversation.tenant_id == tenant_id
+            ).order_by(Conversation.created_at.desc()).limit(limit)
+            
+            result = await self.session.execute(stmt)
+            conversations = result.scalars().all()
 
             return {
                 "status": "success",
                 "count": len(conversations),
-                "conversations": conversations[:limit],
+                "conversations": [
+                    {
+                        "conversation_id": conv.conversation_id,
+                        "call_sid": conv.call_sid,
+                        "customer_phone": conv.customer_phone,
+                        "intent": conv.intent,
+                        "outcome": conv.outcome,
+                        "transferred_to_human": conv.transferred_to_human,
+                        "duration_seconds": conv.duration_seconds,
+                        "created_at": conv.created_at.isoformat(),
+                    }
+                    for conv in conversations
+                ],
             }
 
         except Exception as e:
@@ -268,29 +306,32 @@ class ConversationMemory:
 
         return "GENERAL"
 
-    def _build_transcript_text(self, transcript: list[dict]) -> str:
+    def _build_transcript_text(self, transcript: Optional[list]) -> str:
         """Build readable transcript from messages."""
+        if not transcript:
+            return ""
+        
         lines = []
         for msg in transcript:
-            role = "User" if msg["role"] == "user" else "AI"
-            lines.append(f"{role}: {msg['text']}")
+            role = "User" if msg.get("role") == "user" else "AI"
+            lines.append(f"{role}: {msg.get('text', '')}")
 
         return "\n".join(lines)
 
-    def _summarize_conversation(self, conversation: dict) -> str:
-        """Generate brief summary of conversation."""
+    def _summarize_conversation(self, conversation: Conversation) -> str:
+        """Generate brief summary of conversation from ORM object."""
         parts = []
 
-        if conversation.get("intent"):
-            parts.append(f"Intent: {conversation['intent']}")
+        if conversation.intent:
+            parts.append(f"Intent: {conversation.intent}")
 
-        if conversation["entities"]:
-            parts.append(f"Entities: {json.dumps(conversation['entities'])}")
+        if conversation.entities:
+            parts.append(f"Entities: {json.dumps(conversation.entities)}")
 
-        if conversation.get("outcome"):
-            parts.append(f"Outcome: {conversation['outcome']}")
+        if conversation.outcome:
+            parts.append(f"Outcome: {conversation.outcome}")
 
-        if conversation.get("transferred_to_human"):
+        if conversation.transferred_to_human:
             parts.append("Transferred to human agent")
 
         return " | ".join(parts) if parts else "No summary available"

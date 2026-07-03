@@ -2,6 +2,7 @@
 ActionQueue Manager — Generalized from KDS system
 Handles all action types: orders, appointments, leads, reservations
 Broadcasts via WebSocket to business admin dashboards
+Uses SQLAlchemy ORM for persistence
 """
 
 import json
@@ -13,6 +14,9 @@ from enum import Enum
 from typing import Any, Optional
 
 from fastapi import WebSocket
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from models import Action
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +39,19 @@ class ActionQueueManager:
     """
     Manages persistent WebSocket connections for per-tenant action monitors.
     Broadcasts real-time updates for orders, appointments, leads, reservations.
+    Persists actions to database via SQLAlchemy ORM.
     """
 
-    def __init__(self):
+    def __init__(self, session: AsyncSession):
+        """
+        Initialize with database session.
+        
+        Args:
+            session: AsyncSession from SQLAlchemy
+        """
+        self.session = session
+        # WebSocket connections stay in-memory (ephemeral)
         self._connections: dict[str, set[WebSocket]] = defaultdict(set)
-        self._action_history: dict[str, list[dict]] = defaultdict(list)
 
     async def connect_monitor(self, tenant_id: str, websocket: WebSocket) -> None:
         """Connect a new admin monitor (dashboard) for a tenant."""
@@ -68,7 +80,7 @@ class ActionQueueManager:
         action_data: dict[str, Any],
     ) -> str:
         """
-        Broadcast a new action to all connected monitors.
+        Broadcast a new action to all connected monitors and save to database.
 
         Args:
             tenant_id: Business tenant ID
@@ -79,51 +91,68 @@ class ActionQueueManager:
         Returns:
             action_id (UUID string)
         """
-        action_id = str(uuid.uuid4())
+        try:
+            action_id = str(uuid.uuid4())
 
-        # Build action payload
-        action = {
-            "action_id": action_id,
-            "action_type": action_type.value,
-            "customer_info": customer_info,
-            "action_data": action_data,
-            "status": ActionStatus.NEW.value,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+            # Create action object
+            action = Action(
+                action_id=action_id,
+                tenant_id=tenant_id,
+                action_type=action_type.value,
+                customer_info=customer_info,
+                action_data=action_data,
+                status=ActionStatus.NEW.value,
+            )
 
-        # Store in history
-        self._action_history[tenant_id].append(action)
+            # Save to database
+            self.session.add(action)
+            await self.session.commit()
 
-        # Broadcast to all connected monitors
-        payload = {"event": "NEW_ACTION", "action": action}
-        message = json.dumps(payload)
+            # Build action payload for broadcast
+            action_payload = {
+                "action_id": action_id,
+                "action_type": action_type.value,
+                "customer_info": customer_info,
+                "action_data": action_data,
+                "status": ActionStatus.NEW.value,
+                "created_at": action.created_at.isoformat() if action.created_at else datetime.now(timezone.utc).isoformat(),
+            }
 
-        dead: list[WebSocket] = []
-        for ws in list(self._connections.get(tenant_id, [])):
-            try:
-                await ws.send_text(message)
-            except Exception as e:
-                logger.error(f"Failed to broadcast to monitor: {e}")
-                dead.append(ws)
+            # Broadcast to all connected monitors
+            payload = {"event": "NEW_ACTION", "action": action_payload}
+            message = json.dumps(payload)
 
-        # Clean up dead connections
-        for ws in dead:
-            self.disconnect_monitor(tenant_id, ws)
+            dead: list[WebSocket] = []
+            for ws in list(self._connections.get(tenant_id, [])):
+                try:
+                    await ws.send_text(message)
+                except Exception as e:
+                    logger.error(f"Failed to broadcast to monitor: {e}")
+                    dead.append(ws)
 
-        logger.info(
-            "Action broadcasted | tenant=%s | type=%s | action_id=%s",
-            tenant_id,
-            action_type.value,
-            action_id,
-        )
+            # Clean up dead connections
+            for ws in dead:
+                self.disconnect_monitor(tenant_id, ws)
 
-        return action_id
+            logger.info(
+                "Action broadcasted | tenant=%s | type=%s | action_id=%s",
+                tenant_id,
+                action_type.value,
+                action_id,
+            )
+
+            return action_id
+
+        except Exception as e:
+            logger.error(f"Broadcast action error: {e}")
+            await self.session.rollback()
+            raise
 
     async def update_action_status(
         self, tenant_id: str, action_id: str, new_status: ActionStatus, notes: Optional[str] = None
     ) -> None:
         """
-        Update action status and broadcast to monitors.
+        Update action status in database and broadcast to monitors.
 
         Args:
             tenant_id: Business tenant ID
@@ -131,44 +160,63 @@ class ActionQueueManager:
             new_status: New status (IN_PROGRESS, COMPLETED, FAILED)
             notes: Optional status notes
         """
-        # Find action in history
-        action = None
-        for act in self._action_history.get(tenant_id, []):
-            if act["action_id"] == action_id:
-                action = act
-                break
+        try:
+            # Query action from database
+            stmt = select(Action).where(
+                (Action.tenant_id == tenant_id) &
+                (Action.action_id == action_id)
+            )
+            result = await self.session.execute(stmt)
+            action = result.scalar_one_or_none()
 
-        if not action:
-            logger.warning(f"Action not found: {action_id}")
-            return
+            if not action:
+                logger.warning(f"Action not found: {action_id}")
+                return
 
-        # Update action
-        action["status"] = new_status.value
-        action["updated_at"] = datetime.now(timezone.utc).isoformat()
-        if notes:
-            action["notes"] = notes
+            # Update action
+            action.status = new_status.value
+            if notes:
+                action.notes = notes
 
-        # Broadcast update
-        payload = {"event": "ACTION_UPDATE", "action_id": action_id, "action": action}
-        message = json.dumps(payload)
+            await self.session.commit()
 
-        dead: list[WebSocket] = []
-        for ws in list(self._connections.get(tenant_id, [])):
-            try:
-                await ws.send_text(message)
-            except Exception as e:
-                logger.error(f"Failed to broadcast update: {e}")
-                dead.append(ws)
+            # Build action payload for broadcast
+            action_payload = {
+                "action_id": action_id,
+                "action_type": action.action_type,
+                "customer_info": action.customer_info,
+                "action_data": action.action_data,
+                "status": action.status,
+                "notes": action.notes,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-        for ws in dead:
-            self.disconnect_monitor(tenant_id, ws)
+            # Broadcast update
+            payload = {"event": "ACTION_UPDATE", "action_id": action_id, "action": action_payload}
+            message = json.dumps(payload)
 
-        logger.info(
-            "Action updated | tenant=%s | action_id=%s | status=%s",
-            tenant_id,
-            action_id,
-            new_status.value,
-        )
+            dead: list[WebSocket] = []
+            for ws in list(self._connections.get(tenant_id, [])):
+                try:
+                    await ws.send_text(message)
+                except Exception as e:
+                    logger.error(f"Failed to broadcast update: {e}")
+                    dead.append(ws)
+
+            for ws in dead:
+                self.disconnect_monitor(tenant_id, ws)
+
+            logger.info(
+                "Action updated | tenant=%s | action_id=%s | status=%s",
+                tenant_id,
+                action_id,
+                new_status.value,
+            )
+
+        except Exception as e:
+            logger.error(f"Update action status error: {e}")
+            await self.session.rollback()
+            raise
 
     async def broadcast_order(self, tenant_id: str, order_details: dict[str, Any]) -> str:
         """Convenience method for orders (backward compatible with KDS)."""
@@ -192,10 +240,29 @@ class ActionQueueManager:
             tenant_id, order_id, ActionStatus(status.upper())
         )
 
-    def get_recent_actions(self, tenant_id: str, limit: int = 50) -> list[dict]:
-        """Retrieve recent actions for a tenant."""
-        return self._action_history.get(tenant_id, [])[-limit:]
+    async def get_recent_actions(self, tenant_id: str, limit: int = 50) -> list[dict]:
+        """Retrieve recent actions for a tenant from database."""
+        try:
+            stmt = select(Action).where(
+                Action.tenant_id == tenant_id
+            ).order_by(Action.created_at.desc()).limit(limit)
+            
+            result = await self.session.execute(stmt)
+            actions = result.scalars().all()
 
+            return [
+                {
+                    "action_id": action.action_id,
+                    "action_type": action.action_type,
+                    "customer_info": action.customer_info,
+                    "action_data": action.action_data,
+                    "status": action.status,
+                    "notes": action.notes,
+                    "created_at": action.created_at.isoformat() if action.created_at else None,
+                }
+                for action in actions
+            ]
 
-# Global instance (same pattern as KDS)
-action_queue = ActionQueueManager()
+        except Exception as e:
+            logger.error(f"Get recent actions error: {e}")
+            return []

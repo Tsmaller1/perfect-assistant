@@ -1,6 +1,7 @@
 """
 Payment Handoff System
 Transfers calls to humans when payment is needed, creates lead records
+Uses SQLAlchemy ORM with Supabase PostgreSQL
 """
 
 import logging
@@ -8,21 +9,25 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from twilio.rest import Client as TwilioClient
+from models import Lead
 
 logger = logging.getLogger(__name__)
 
-# In-memory storage (replace with DB in production)
-LEADS = {}  # {tenant_id: [leads]}
-PAYMENT_TRANSFERS = {}  # {call_sid: transfer_info}
-
 
 class PaymentHandoffManager:
-    """Manages payment handoff to human representatives."""
+    """Manages payment handoff to human representatives via database."""
 
-    def __init__(self):
-        self.leads = LEADS
-        self.transfers = PAYMENT_TRANSFERS
+    def __init__(self, session: AsyncSession):
+        """
+        Initialize with database session.
+        
+        Args:
+            session: AsyncSession from SQLAlchemy
+        """
+        self.session = session
         # Initialize Twilio client (from env in production)
         self.twilio_client = None
 
@@ -40,7 +45,7 @@ class PaymentHandoffManager:
     ) -> dict:
         """
         Initiate payment handoff for a customer call.
-        Creates a lead record and facilitates transfer to human.
+        Creates a lead record in database and facilitates transfer to human.
 
         Args:
             tenant_id: Business tenant ID
@@ -61,39 +66,26 @@ class PaymentHandoffManager:
             }
         """
         try:
-            # Create lead record
+            # Create lead object
             lead_id = str(uuid.uuid4())
-            lead = {
-                "lead_id": lead_id,
-                "tenant_id": tenant_id,
-                "customer_name": customer_name or "Unknown",
-                "customer_phone": customer_phone,
-                "customer_email": customer_email,
-                "order_value": order_value,
-                "order_items": order_items or [],
-                "notes": notes,
-                "qualification_score": self._calculate_qualification_score(order_value),
-                "status": "PAYMENT_PENDING",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            lead = Lead(
+                lead_id=lead_id,
+                tenant_id=tenant_id,
+                call_sid=call_sid,
+                customer_name=customer_name or "Unknown",
+                customer_phone=customer_phone,
+                customer_email=customer_email,
+                order_value=order_value,
+                order_items=order_items or [],
+                status="PAYMENT_PENDING",
+                payment_status="PENDING",
+                qualification_score=self._calculate_qualification_score(order_value),
+                notes=notes,
+            )
 
-            # Store lead
-            if tenant_id not in self.leads:
-                self.leads[tenant_id] = []
-
-            self.leads[tenant_id].append(lead)
-
-            # Record transfer
-            transfer = {
-                "call_sid": call_sid,
-                "lead_id": lead_id,
-                "tenant_id": tenant_id,
-                "initiated_at": datetime.now(timezone.utc).isoformat(),
-                "owner_phone": owner_phone,
-                "status": "INITIATED",
-            }
-
-            self.transfers[call_sid] = transfer
+            # Save to database
+            self.session.add(lead)
+            await self.session.commit()
 
             logger.info(
                 f"Payment handoff initiated | tenant={tenant_id} | lead_id={lead_id} | call_sid={call_sid}"
@@ -108,6 +100,7 @@ class PaymentHandoffManager:
 
         except Exception as e:
             logger.error(f"Payment handoff error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e), "transfer_initiated": False}
 
     async def complete_payment_transfer(
@@ -118,7 +111,7 @@ class PaymentHandoffManager:
         amount: Optional[float] = None,
     ) -> dict:
         """
-        Mark payment transfer as complete.
+        Mark payment transfer as complete in database.
 
         Args:
             call_sid: Twilio call SID
@@ -130,31 +123,25 @@ class PaymentHandoffManager:
             Status of completion
         """
         try:
-            transfer = self.transfers.get(call_sid)
+            # Query lead by call_sid
+            stmt = select(Lead).where(Lead.call_sid == call_sid)
+            result = await self.session.execute(stmt)
+            lead = result.scalar_one_or_none()
 
-            if not transfer:
-                return {"status": "error", "error": "Transfer not found"}
-
-            lead_id = transfer["lead_id"]
-            tenant_id = transfer["tenant_id"]
-
-            # Update transfer
-            transfer["status"] = "COMPLETED"
-            transfer["completed_at"] = datetime.now(timezone.utc).isoformat()
-            transfer["payment_status"] = payment_status
-            transfer["amount"] = amount
+            if not lead:
+                return {"status": "error", "error": "Lead not found"}
 
             # Update lead status
-            leads = self.leads.get(tenant_id, [])
-            for lead in leads:
-                if lead["lead_id"] == lead_id:
-                    lead["status"] = payment_status
-                    if payment_status == "COMPLETED":
-                        lead["status"] = "CONVERTED"
-                    lead["payment_method"] = payment_method
-                    lead["amount_paid"] = amount
-                    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
-                    break
+            lead.payment_status = payment_status
+            lead.payment_method = payment_method
+            lead.amount = amount
+            
+            if payment_status == "COMPLETED":
+                lead.status = "CONVERTED"
+            else:
+                lead.status = payment_status
+
+            await self.session.commit()
 
             logger.info(
                 f"Payment transfer completed | call_sid={call_sid} | status={payment_status}"
@@ -162,29 +149,46 @@ class PaymentHandoffManager:
 
             return {
                 "status": "success",
-                "lead_id": lead_id,
+                "lead_id": lead.lead_id,
                 "payment_status": payment_status,
             }
 
         except Exception as e:
             logger.error(f"Complete transfer error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e)}
 
     async def get_leads(self, tenant_id: str, status: Optional[str] = None) -> dict:
-        """Get all leads for a tenant."""
+        """Get all leads for a tenant from database."""
         try:
-            leads = self.leads.get(tenant_id, [])
+            query = select(Lead).where(Lead.tenant_id == tenant_id)
 
             if status:
-                leads = [lead for lead in leads if lead["status"] == status]
-
-            # Sort by qualification score (highest first)
-            leads.sort(key=lambda x: x.get("qualification_score", 0), reverse=True)
+                query = query.where(Lead.status == status)
+            
+            # Order by qualification score (highest first)
+            query = query.order_by(Lead.qualification_score.desc())
+            
+            result = await self.session.execute(query)
+            leads = result.scalars().all()
 
             return {
                 "status": "success",
                 "count": len(leads),
-                "leads": leads,
+                "leads": [
+                    {
+                        "lead_id": lead.lead_id,
+                        "customer_name": lead.customer_name,
+                        "customer_phone": lead.customer_phone,
+                        "customer_email": lead.customer_email,
+                        "order_value": lead.order_value,
+                        "status": lead.status,
+                        "payment_status": lead.payment_status,
+                        "qualification_score": lead.qualification_score,
+                        "created_at": lead.created_at.isoformat(),
+                    }
+                    for lead in leads
+                ],
             }
 
         except Exception as e:
@@ -194,30 +198,43 @@ class PaymentHandoffManager:
     async def update_lead_status(
         self, tenant_id: str, lead_id: str, new_status: str, notes: str = ""
     ) -> dict:
-        """Update lead status."""
+        """Update lead status in database."""
         try:
-            leads = self.leads.get(tenant_id, [])
-
-            lead = None
-            for l in leads:
-                if l["lead_id"] == lead_id:
-                    lead = l
-                    break
+            # Query lead from database
+            stmt = select(Lead).where(
+                (Lead.tenant_id == tenant_id) &
+                (Lead.lead_id == lead_id)
+            )
+            result = await self.session.execute(stmt)
+            lead = result.scalar_one_or_none()
 
             if not lead:
                 return {"status": "error", "error": "Lead not found"}
 
-            lead["status"] = new_status
+            lead.status = new_status
             if notes:
-                lead["notes"] = (lead.get("notes", "") + f"\n[{datetime.now().isoformat()}] {notes}").strip()
-            lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+                existing_notes = lead.notes or ""
+                lead.notes = f"{existing_notes}\n[{datetime.now(timezone.utc).isoformat()}] {notes}".strip()
+
+            await self.session.commit()
 
             logger.info(f"Lead status updated | lead_id={lead_id} | status={new_status}")
 
-            return {"status": "success", "lead": lead}
+            return {
+                "status": "success",
+                "lead": {
+                    "lead_id": lead.lead_id,
+                    "customer_name": lead.customer_name,
+                    "customer_phone": lead.customer_phone,
+                    "customer_email": lead.customer_email,
+                    "status": lead.status,
+                    "created_at": lead.created_at.isoformat(),
+                },
+            }
 
         except Exception as e:
             logger.error(f"Update lead error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e)}
 
     def _calculate_qualification_score(self, order_value: Optional[float]) -> float:
@@ -241,32 +258,35 @@ class PaymentHandoffManager:
     async def get_qualified_leads(
         self, tenant_id: str, min_score: float = 0.6
     ) -> dict:
-        """Get only high-quality leads."""
+        """Get only high-quality leads from database."""
         try:
-            leads = self.leads.get(tenant_id, [])
-
-            qualified = [
-                lead
-                for lead in leads
-                if lead.get("qualification_score", 0) >= min_score
-                and lead["status"] in ["PAYMENT_PENDING", "AUTHORIZED"]
-            ]
-
-            # Sort by score
-            qualified.sort(
-                key=lambda x: x.get("qualification_score", 0), reverse=True
-            )
+            query = select(Lead).where(
+                (Lead.tenant_id == tenant_id) &
+                (Lead.qualification_score >= min_score) &
+                (Lead.status.in_(["PAYMENT_PENDING", "AUTHORIZED"]))
+            ).order_by(Lead.qualification_score.desc())
+            
+            result = await self.session.execute(query)
+            leads = result.scalars().all()
 
             return {
                 "status": "success",
-                "count": len(qualified),
-                "qualified_leads": qualified,
+                "count": len(leads),
+                "qualified_leads": [
+                    {
+                        "lead_id": lead.lead_id,
+                        "customer_name": lead.customer_name,
+                        "customer_phone": lead.customer_phone,
+                        "customer_email": lead.customer_email,
+                        "order_value": lead.order_value,
+                        "qualification_score": lead.qualification_score,
+                        "status": lead.status,
+                        "created_at": lead.created_at.isoformat(),
+                    }
+                    for lead in leads
+                ],
             }
 
         except Exception as e:
             logger.error(f"Get qualified leads error: {e}")
             return {"status": "error", "error": str(e)}
-
-
-# Global instance
-payment_handoff = PaymentHandoffManager()

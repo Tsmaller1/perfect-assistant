@@ -1,27 +1,32 @@
 """
 Appointments/Reservations Management
 Handles scheduling, availability checking, and booking
+Uses SQLAlchemy ORM with Supabase PostgreSQL
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional
 import uuid
+
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from models import Appointment
 
 logger = logging.getLogger(__name__)
 
 
-# In-memory storage (replace with DB in production)
-APPOINTMENTS = {}  # {tenant_id: [appointments]}
-BUSINESS_HOURS = {}  # {tenant_id: hours_config}
-
-
 class AppointmentManager:
-    """Manages business appointments and availability."""
+    """Manages business appointments and availability via database."""
 
-    def __init__(self):
-        self.appointments = APPOINTMENTS
-        self.business_hours = BUSINESS_HOURS
+    def __init__(self, session: AsyncSession):
+        """
+        Initialize with database session.
+        
+        Args:
+            session: AsyncSession from SQLAlchemy
+        """
+        self.session = session
 
     async def check_availability(
         self,
@@ -31,7 +36,7 @@ class AppointmentManager:
         duration_minutes: int = 30,
     ) -> dict:
         """
-        Check if a time slot is available.
+        Check if a time slot is available by querying database.
 
         Args:
             tenant_id: Business tenant ID
@@ -48,28 +53,30 @@ class AppointmentManager:
         try:
             # Parse datetime
             dt_str = f"{date_str} {start_time}"
-            requested_start = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+            requested_start = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
             requested_end = requested_start + timedelta(minutes=duration_minutes)
 
-            # Get tenant's existing appointments
-            tenant_appointments = self.appointments.get(tenant_id, [])
+            # Query database for tenant's appointments (exclude CANCELLED/COMPLETED)
+            stmt = select(Appointment).where(
+                (Appointment.tenant_id == tenant_id) &
+                (Appointment.status.in_(["BOOKED", "IN_PROGRESS"]))
+            )
+            result = await self.session.execute(stmt)
+            appointments = result.scalars().all()
 
             # Check for conflicts
             conflicts = []
-            for apt in tenant_appointments:
-                if apt["status"] in ["CANCELLED", "COMPLETED"]:
-                    continue
-
-                apt_start = datetime.fromisoformat(apt["scheduled_datetime"])
-                apt_end = apt_start + timedelta(minutes=apt.get("duration_minutes", 30))
+            for apt in appointments:
+                apt_start = apt.scheduled_datetime
+                apt_end = apt_start + timedelta(minutes=apt.duration_minutes)
 
                 # Check for overlap
                 if requested_start < apt_end and requested_end > apt_start:
                     conflicts.append(
                         {
-                            "appointment_id": apt["appointment_id"],
-                            "customer_name": apt["customer_name"],
-                            "time": apt["scheduled_datetime"],
+                            "appointment_id": apt.appointment_id,
+                            "customer_name": apt.customer_name,
+                            "time": apt.scheduled_datetime.isoformat(),
                         }
                     )
 
@@ -98,7 +105,7 @@ class AppointmentManager:
         notes: str = "",
     ) -> dict:
         """
-        Book a new appointment.
+        Book a new appointment in database.
 
         Args:
             tenant_id: Business tenant ID
@@ -133,27 +140,24 @@ class AppointmentManager:
                     "error": f"Time slot not available. Conflicts: {availability['conflicts']}",
                 }
 
-            # Create appointment
+            # Create appointment object
             appointment_id = str(uuid.uuid4())
-            appointment = {
-                "appointment_id": appointment_id,
-                "tenant_id": tenant_id,
-                "customer_name": customer_name,
-                "customer_email": customer_email,
-                "customer_phone": customer_phone,
-                "scheduled_datetime": scheduled_datetime,
-                "service_type": service_type,
-                "duration_minutes": duration_minutes,
-                "notes": notes,
-                "status": "BOOKED",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            appointment = Appointment(
+                appointment_id=appointment_id,
+                tenant_id=tenant_id,
+                customer_name=customer_name,
+                customer_email=customer_email,
+                customer_phone=customer_phone,
+                scheduled_datetime=datetime.fromisoformat(scheduled_datetime),
+                service_type=service_type,
+                duration_minutes=duration_minutes,
+                status="BOOKED",
+                notes=notes,
+            )
 
-            # Store appointment
-            if tenant_id not in self.appointments:
-                self.appointments[tenant_id] = []
-
-            self.appointments[tenant_id].append(appointment)
+            # Save to database
+            self.session.add(appointment)
+            await self.session.commit()
 
             logger.info(
                 f"Appointment booked | tenant={tenant_id} | appointment_id={appointment_id}"
@@ -162,27 +166,58 @@ class AppointmentManager:
             return {
                 "status": "success",
                 "appointment_id": appointment_id,
-                "appointment": appointment,
+                "appointment": {
+                    "appointment_id": appointment.appointment_id,
+                    "tenant_id": appointment.tenant_id,
+                    "customer_name": appointment.customer_name,
+                    "customer_email": appointment.customer_email,
+                    "customer_phone": appointment.customer_phone,
+                    "scheduled_datetime": appointment.scheduled_datetime.isoformat(),
+                    "service_type": appointment.service_type,
+                    "duration_minutes": appointment.duration_minutes,
+                    "status": appointment.status,
+                    "notes": appointment.notes,
+                    "created_at": appointment.created_at.isoformat(),
+                },
             }
 
         except Exception as e:
             logger.error(f"Booking error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e)}
 
     async def get_appointments(
         self, tenant_id: str, status: Optional[str] = None
     ) -> dict:
-        """Get all appointments for a tenant."""
+        """Get all appointments for a tenant from database."""
         try:
-            appointments = self.appointments.get(tenant_id, [])
-
+            query = select(Appointment).where(Appointment.tenant_id == tenant_id)
+            
             if status:
-                appointments = [apt for apt in appointments if apt["status"] == status]
+                query = query.where(Appointment.status == status)
+            
+            result = await self.session.execute(query)
+            appointments = result.scalars().all()
 
             return {
                 "status": "success",
                 "count": len(appointments),
-                "appointments": appointments,
+                "appointments": [
+                    {
+                        "appointment_id": apt.appointment_id,
+                        "tenant_id": apt.tenant_id,
+                        "customer_name": apt.customer_name,
+                        "customer_email": apt.customer_email,
+                        "customer_phone": apt.customer_phone,
+                        "scheduled_datetime": apt.scheduled_datetime.isoformat(),
+                        "service_type": apt.service_type,
+                        "duration_minutes": apt.duration_minutes,
+                        "status": apt.status,
+                        "notes": apt.notes,
+                        "created_at": apt.created_at.isoformat(),
+                    }
+                    for apt in appointments
+                ],
             }
 
         except Exception as e:
@@ -192,22 +227,22 @@ class AppointmentManager:
     async def cancel_appointment(
         self, tenant_id: str, appointment_id: str, reason: str = ""
     ) -> dict:
-        """Cancel an appointment."""
+        """Cancel an appointment in database."""
         try:
-            appointments = self.appointments.get(tenant_id, [])
-
-            appointment = None
-            for apt in appointments:
-                if apt["appointment_id"] == appointment_id:
-                    appointment = apt
-                    break
+            stmt = select(Appointment).where(
+                (Appointment.tenant_id == tenant_id) &
+                (Appointment.appointment_id == appointment_id)
+            )
+            result = await self.session.execute(stmt)
+            appointment = result.scalar_one_or_none()
 
             if not appointment:
                 return {"status": "error", "error": "Appointment not found"}
 
-            appointment["status"] = "CANCELLED"
-            appointment["cancellation_reason"] = reason
-            appointment["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+            appointment.status = "CANCELLED"
+            appointment.notes = f"{appointment.notes}\n\nCancellation reason: {reason}" if appointment.notes else f"Cancellation reason: {reason}"
+            
+            await self.session.commit()
 
             logger.info(
                 f"Appointment cancelled | tenant={tenant_id} | appointment_id={appointment_id}"
@@ -216,69 +251,106 @@ class AppointmentManager:
             return {
                 "status": "success",
                 "appointment_id": appointment_id,
-                "appointment": appointment,
+                "appointment": {
+                    "appointment_id": appointment.appointment_id,
+                    "tenant_id": appointment.tenant_id,
+                    "customer_name": appointment.customer_name,
+                    "customer_email": appointment.customer_email,
+                    "customer_phone": appointment.customer_phone,
+                    "scheduled_datetime": appointment.scheduled_datetime.isoformat(),
+                    "service_type": appointment.service_type,
+                    "duration_minutes": appointment.duration_minutes,
+                    "status": appointment.status,
+                    "notes": appointment.notes,
+                    "created_at": appointment.created_at.isoformat(),
+                },
             }
 
         except Exception as e:
             logger.error(f"Cancellation error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e)}
 
     async def update_appointment_status(
         self, tenant_id: str, appointment_id: str, new_status: str
     ) -> dict:
-        """Update appointment status."""
+        """Update appointment status in database."""
         try:
-            appointments = self.appointments.get(tenant_id, [])
-
-            appointment = None
-            for apt in appointments:
-                if apt["appointment_id"] == appointment_id:
-                    appointment = apt
-                    break
+            stmt = select(Appointment).where(
+                (Appointment.tenant_id == tenant_id) &
+                (Appointment.appointment_id == appointment_id)
+            )
+            result = await self.session.execute(stmt)
+            appointment = result.scalar_one_or_none()
 
             if not appointment:
                 return {"status": "error", "error": "Appointment not found"}
 
-            appointment["status"] = new_status
-            appointment["updated_at"] = datetime.now(timezone.utc).isoformat()
+            appointment.status = new_status
+            await self.session.commit()
 
             return {
                 "status": "success",
                 "appointment_id": appointment_id,
-                "appointment": appointment,
+                "appointment": {
+                    "appointment_id": appointment.appointment_id,
+                    "tenant_id": appointment.tenant_id,
+                    "customer_name": appointment.customer_name,
+                    "customer_email": appointment.customer_email,
+                    "customer_phone": appointment.customer_phone,
+                    "scheduled_datetime": appointment.scheduled_datetime.isoformat(),
+                    "service_type": appointment.service_type,
+                    "duration_minutes": appointment.duration_minutes,
+                    "status": appointment.status,
+                    "notes": appointment.notes,
+                    "created_at": appointment.created_at.isoformat(),
+                },
             }
 
         except Exception as e:
             logger.error(f"Update status error: {e}")
+            await self.session.rollback()
             return {"status": "error", "error": str(e)}
 
     async def get_daily_schedule(self, tenant_id: str, date_str: str) -> dict:
-        """Get all appointments for a specific day."""
+        """Get all appointments for a specific day from database."""
         try:
-            appointments = self.appointments.get(tenant_id, [])
+            # Parse date
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            next_date = target_date + timedelta(days=1)
 
-            # Filter by date
-            daily_appointments = [
-                apt
-                for apt in appointments
-                if apt["scheduled_datetime"].startswith(date_str)
-                and apt["status"] != "CANCELLED"
-            ]
-
-            # Sort by time
-            daily_appointments.sort(key=lambda x: x["scheduled_datetime"])
+            # Query for appointments on that day (excluding CANCELLED)
+            stmt = select(Appointment).where(
+                (Appointment.tenant_id == tenant_id) &
+                (func.date(Appointment.scheduled_datetime) == target_date) &
+                (Appointment.status != "CANCELLED")
+            ).order_by(Appointment.scheduled_datetime)
+            
+            result = await self.session.execute(stmt)
+            appointments = result.scalars().all()
 
             return {
                 "status": "success",
                 "date": date_str,
-                "count": len(daily_appointments),
-                "appointments": daily_appointments,
+                "count": len(appointments),
+                "appointments": [
+                    {
+                        "appointment_id": apt.appointment_id,
+                        "tenant_id": apt.tenant_id,
+                        "customer_name": apt.customer_name,
+                        "customer_email": apt.customer_email,
+                        "customer_phone": apt.customer_phone,
+                        "scheduled_datetime": apt.scheduled_datetime.isoformat(),
+                        "service_type": apt.service_type,
+                        "duration_minutes": apt.duration_minutes,
+                        "status": apt.status,
+                        "notes": apt.notes,
+                        "created_at": apt.created_at.isoformat(),
+                    }
+                    for apt in appointments
+                ],
             }
 
         except Exception as e:
             logger.error(f"Daily schedule error: {e}")
             return {"status": "error", "error": str(e)}
-
-
-# Global instance
-appointment_manager = AppointmentManager()
