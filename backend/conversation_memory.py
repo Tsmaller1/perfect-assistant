@@ -383,7 +383,3 @@ class ConversationMemory:
             entities["date"] = date_match.group(1)
 
         return entities
-
-
-# Global instance
-conversation_memory = ConversationMemory()
