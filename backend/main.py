@@ -1,10 +1,13 @@
 import logging
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from datetime import datetime, timedelta
 
 from database import get_db
+from models import Business, Action, Conversation, Order
 from action_queue import ActionQueueManager
 from appointments import AppointmentManager
 from payment_handoff import PaymentHandoffManager
@@ -32,16 +35,17 @@ app.include_router(telephony_router)
 
 @app.websocket("/api/kds/{tenant_id}/stream")
 async def action_stream(websocket: WebSocket, tenant_id: str, session: AsyncSession = Depends(get_db)):
-    """WebSocket for real-time action updates to admin dashboard."""
+    """WebSocket for real-time action updates to Kitchen Display System."""
     action_manager = ActionQueueManager(session)
     await action_manager.connect_monitor(tenant_id, websocket)
     try:
         while True:
             data = await websocket.receive_json()
             if data.get("event") == "COMPLETE_TICKET":
+                order_id = data.get("order_id") or data.get("action_id")
                 await action_manager.update_action_status(
                     tenant_id,
-                    action_id=data["action_id"],
+                    action_id=order_id,
                     new_status="COMPLETED",
                 )
     except WebSocketDisconnect:
@@ -214,25 +218,132 @@ async def get_recent_actions(
 
 
 @app.get("/dashboard/{tenant_id}/metrics")
-async def get_metrics(tenant_id: str):
-    # Stub — replace with real DB queries
-    return {
-        "metrics": {
-            "totalCalls": 24,
-            "aiHandled": 19,
-            "avgDuration": "3:42",
-            "ordersToday": 17,
-        },
-        "phone_config": {
-            "twilioNumber": "",
-            "ownerPhone": "",
-        },
-        "ai_mode_enabled": True,
-        "active_call_sid": None,
-    }
+async def get_metrics(
+    tenant_id: str,
+    session: AsyncSession = Depends(get_db)
+):
+    """Get real-time metrics for the dashboard."""
+    try:
+        # Get business config
+        stmt = select(Business).where(Business.tenant_id == tenant_id)
+        result = await session.execute(stmt)
+        business = result.scalar_one_or_none()
+        
+        if not business:
+            raise HTTPException(status_code=404, detail="Business not found")
+        
+        # Count conversations from today
+        today = datetime.utcnow().date()
+        today_start = datetime.combine(today, datetime.min.time())
+        
+        stmt_conversations = select(Conversation).where(
+            (Conversation.tenant_id == tenant_id) &
+            (Conversation.created_at >= today_start)
+        )
+        result_conversations = await session.execute(stmt_conversations)
+        all_conversations = result_conversations.scalars().all()
+        
+        total_calls = len(all_conversations)
+        ai_handled = sum(1 for c in all_conversations if not c.transferred_to_human)
+        
+        # Calculate average call duration
+        avg_duration_seconds = 0
+        if all_conversations:
+            durations = [c.duration_seconds or 0 for c in all_conversations]
+            avg_duration_seconds = int(sum(durations) / len(durations))
+        
+        minutes = avg_duration_seconds // 60
+        seconds = avg_duration_seconds % 60
+        avg_duration_str = f"{minutes}:{seconds:02d}"
+        
+        # Count orders from today (status = PICKED_UP or READY)
+        stmt_orders = select(Order).where(
+            (Order.tenant_id == tenant_id) &
+            (Order.created_at >= today_start) &
+            (Order.status.in_(["PICKED_UP", "READY"]))
+        )
+        result_orders = await session.execute(stmt_orders)
+        orders_today = len(result_orders.scalars().all())
+        
+        return {
+            "metrics": {
+                "totalCalls": total_calls,
+                "aiHandled": ai_handled,
+                "avgDuration": avg_duration_str,
+                "ordersToday": orders_today,
+            },
+            "phone_config": {
+                "twilioNumber": business.twilio_number or "",
+                "ownerPhone": business.owner_phone or "",
+            },
+            "ai_mode_enabled": business.ai_mode_enabled if business.ai_mode_enabled is not None else True,
+            "active_call_sid": None,  # TODO: Track active calls in a separate table
+        }
+    except Exception as e:
+        logger.error(f"Metrics error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/dashboard/{tenant_id}/phone-config")
-async def save_phone_config(tenant_id: str):
-    # Stub — persist to DB
-    return {"status": "saved"}
+async def save_phone_config(
+    tenant_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db)
+):
+    """Save phone configuration for a business."""
+    try:
+        body = await request.json()
+        
+        # Fetch business
+        stmt = select(Business).where(Business.tenant_id == tenant_id)
+        result = await session.execute(stmt)
+        business = result.scalar_one_or_none()
+        
+        if not business:
+            raise HTTPException(status_code=404, detail="Business not found")
+        
+        # Update phone numbers
+        business.twilio_number = body.get("twilioNumber", business.twilio_number)
+        business.owner_phone = body.get("ownerPhone", business.owner_phone)
+        business.updated_at = datetime.utcnow()
+        
+        await session.commit()
+        
+        return {"status": "saved"}
+    except Exception as e:
+        logger.error(f"Phone config save error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/telephony/toggle-mode/{tenant_id}")
+async def toggle_ai_mode(
+    tenant_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db)
+):
+    """Toggle between AI mode and live person mode."""
+    try:
+        body = await request.json()
+        
+        # Fetch business
+        stmt = select(Business).where(Business.tenant_id == tenant_id)
+        result = await session.execute(stmt)
+        business = result.scalar_one_or_none()
+        
+        if not business:
+            raise HTTPException(status_code=404, detail="Business not found")
+        
+        mode = body.get("mode", "AI")
+        business.ai_mode_enabled = (mode == "AI")
+        business.updated_at = datetime.utcnow()
+        
+        await session.commit()
+        
+        return {
+            "status": "success",
+            "ai_mode_enabled": business.ai_mode_enabled,
+            "mode": mode,
+        }
+    except Exception as e:
+        logger.error(f"Mode toggle error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

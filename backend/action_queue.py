@@ -118,6 +118,22 @@ class ActionQueueManager:
                 "created_at": action.created_at.isoformat() if action.created_at else datetime.now(timezone.utc).isoformat(),
             }
 
+            # For ORDER type actions, also send KDS-format ticket for kitchen display
+            if action_type == ActionType.ORDER:
+                ticket = {
+                    "order_id": action_id,
+                    "customer_name": customer_info.get("name", "Unknown"),
+                    "customer_phone": customer_info.get("phone", ""),
+                    "items": action_data.get("items", []),
+                    "special_instructions": action_data.get("notes", ""),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                kds_payload = {"event": "NEW_ORDER", "ticket": ticket}
+                kds_message = json.dumps(kds_payload)
+            else:
+                kds_payload = None
+                kds_message = None
+
             # Broadcast to all connected monitors
             payload = {"event": "NEW_ACTION", "action": action_payload}
             message = json.dumps(payload)
@@ -125,7 +141,8 @@ class ActionQueueManager:
             dead: list[WebSocket] = []
             for ws in list(self._connections.get(tenant_id, [])):
                 try:
-                    await ws.send_text(message)
+                    # Send KDS format if ORDER, otherwise send generic ACTION format
+                    await ws.send_text(kds_message if kds_message else message)
                 except Exception as e:
                     logger.error(f"Failed to broadcast to monitor: {e}")
                     dead.append(ws)
@@ -191,6 +208,17 @@ class ActionQueueManager:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
 
+            # For ORDER type actions, also send KDS-format update for kitchen display
+            if action.action_type == ActionType.ORDER.value:
+                kds_payload = {
+                    "event": "TICKET_UPDATE",
+                    "order_id": action_id,
+                    "status": action.status,
+                }
+                kds_message = json.dumps(kds_payload)
+            else:
+                kds_message = None
+
             # Broadcast update
             payload = {"event": "ACTION_UPDATE", "action_id": action_id, "action": action_payload}
             message = json.dumps(payload)
@@ -198,7 +226,8 @@ class ActionQueueManager:
             dead: list[WebSocket] = []
             for ws in list(self._connections.get(tenant_id, [])):
                 try:
-                    await ws.send_text(message)
+                    # Send KDS format if ORDER, otherwise send generic ACTION format
+                    await ws.send_text(kds_message if kds_message else message)
                 except Exception as e:
                     logger.error(f"Failed to broadcast update: {e}")
                     dead.append(ws)

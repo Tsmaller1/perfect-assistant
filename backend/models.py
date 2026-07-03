@@ -26,6 +26,8 @@ class Business(Base):
     social_media = Column(JSON)  # {facebook, instagram, linkedin, ...}
     ai_context = Column(Text)  # Formatted business knowledge for AI
     owner_phone = Column(String(20))
+    twilio_number = Column(String(20))  # Twilio phone number for AI line
+    ai_mode_enabled = Column(Boolean, default=True)  # AI answering vs. live person
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
