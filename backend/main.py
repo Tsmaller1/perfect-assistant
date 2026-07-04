@@ -30,6 +30,16 @@ app.include_router(telephony_router)
 
 
 # ============================================================================
+# HEALTH CHECK
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Docker container monitoring."""
+    return {"status": "healthy", "service": "Perfect Assistant Backend"}
+
+
+# ============================================================================
 # ACTION QUEUE & DASHBOARD STREAMS
 # ============================================================================
 

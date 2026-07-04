@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import attributes
 from models import Conversation
 
 logger = logging.getLogger(__name__)
@@ -124,12 +125,14 @@ class ConversationMemory:
             if conversation.transcript is None:
                 conversation.transcript = []
             conversation.transcript.append(message)
+            attributes.flag_modified(conversation, "transcript")
 
             # Update entities if provided
             if entities:
                 if conversation.entities is None:
                     conversation.entities = {}
                 conversation.entities.update(entities)
+                attributes.flag_modified(conversation, "entities")
 
             # Detect intent from user message
             if role == "user":

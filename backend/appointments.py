@@ -68,6 +68,10 @@ class AppointmentManager:
             conflicts = []
             for apt in appointments:
                 apt_start = apt.scheduled_datetime
+                # Ensure apt_start is timezone-aware (SQLite returns naive datetimes)
+                if apt_start.tzinfo is None:
+                    apt_start = apt_start.replace(tzinfo=timezone.utc)
+                
                 apt_end = apt_start + timedelta(minutes=apt.duration_minutes)
 
                 # Check for overlap

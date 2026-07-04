@@ -1,0 +1,215 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pine-sales
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pine-sales-config
+  namespace: pine-sales
+data:
+  ENV: "production"
+  PYTHONUNBUFFERED: "1"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pine-sales-secrets
+  namespace: pine-sales
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql+asyncpg://postgres:password@postgres:5432/pine_sales_ai"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pine-sales-backend
+  namespace: pine-sales
+  labels:
+    app: pine-sales
+    component: backend
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: pine-sales
+      component: backend
+  template:
+    metadata:
+      labels:
+        app: pine-sales
+        component: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+      - name: backend
+        image: ghcr.io/your-username/pine-sales-ai/backend:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        
+        # Environment Variables
+        envFrom:
+        - configMapRef:
+            name: pine-sales-config
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: pine-sales-secrets
+              key: DATABASE_URL
+        
+        # Resource Limits
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        
+        # Liveness Probe (restart if dead)
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness Probe (route traffic if ready)
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        
+        # Startup Probe (slow start handling)
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 0
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 30
+        
+        # Graceful Shutdown
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pine-sales-backend
+  namespace: pine-sales
+  labels:
+    app: pine-sales
+    component: backend
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: pine-sales
+    component: backend
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: pine-sales-backend-hpa
+  namespace: pine-sales
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pine-sales-backend
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pine-sales-backend-pdb
+  namespace: pine-sales
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pine-sales
+      component: backend
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pine-sales-backend
+  namespace: pine-sales
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pine-sales-backend
+  namespace: pine-sales
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pine-sales-backend
+  namespace: pine-sales
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pine-sales-backend
+subjects:
+- kind: ServiceAccount
+  name: pine-sales-backend
+  namespace: pine-sales
